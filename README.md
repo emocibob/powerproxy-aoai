@@ -87,15 +87,26 @@ can switch to a specific version by running `git checkout tags\<tag>` after clon
 environment. Note: Any file without `.example` in its name will intentionally be ignored by git to
 avoid secrets being committed to the repo.
 
-5. Make sure you have a Python environment with the packages from `requirements.txt` installed
+5. Make sure you have a Python environment with the packages from `requirements.txt` installed.
+   You can create a new environment like this:
 
-6. Open the repo folder in VS.Code.
+   ```shell
+   python3 -m venv .venv
+   source .venv/bin/activate # Command for bash/zsh
+   python3 -m pip install -r requirements.txt
+   ```
 
-7. Activate the right Python environment.
+6. If you're using VS Code:
 
-8. Optionally set a breakpoint in `powerproxy.py` and
+    1. Open the repo folder in it.
 
-9. Launch the `Debug powerproxy.py` launch configuration.
+   2. Activate the right Python environment.
+
+   3. Optionally set a breakpoint in `powerproxy.py` and
+
+   4. Launch the `Debug powerproxy.py` launch configuration.
+
+7. If you want to directly run the app use `python3 app/powerproxy.py --config-file config/config.local.yaml`
 
 To access your Azure OpenAI service via the proxy:
 - Use `http://localhost` as the endpoint for your AOAI service instead of the real endpoint for
@@ -114,9 +125,77 @@ make sure it contains the right settings for your cloud environment.
 as `-ConfigFile` argument. For example: `.\Deploy-ToAzure.ps1 -ConfigFile config/config.azure.yaml`
 Once the deployment script has successfully completed, your proxy should be up and running.
 
+You can find the URL of the container app, i.e. proxy, in the Azure portal or with the following Azure CLI
+command (adjust the resource group name as needed):
+
+```shell
+az containerapp show --name powerproxyaoai --resource-group powerproxy-aoai --query "properties.configuration.ingress.fqdn" --output tsv
+```
+
+#### Troubleshooting Azure deployment issues
+
+If you see the following error, simply try re-running the deployment script.
+
+```
+The command failed with an unexpected error. Here is the traceback:
+Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+```
+
+You might see the following errors:
+
+```
+(AuthorizationFailed) The client 'foo.bar@example.com' with object id '1234' does not have authorization to perform action 'Microsoft.App/containerApps/listSecrets/action' over scope '/subscriptions/1111/resourceGroups/powerproxy-aoai/providers/Microsoft.App/containerApps/powerproxyaoai' or the scope is invalid. If access was recently granted, please refresh your credentials.
+Assigning managed identity to Container App...
+(AuthorizationFailed) The client 'foo.bar@example.com' with object id '1234' does not have authorization to perform action 'Microsoft.App/containerApps/listSecrets/action' over scope '/subscriptions/1111/resourceGroups/powerproxy-aoai/providers/Microsoft.App/containerApps/powerproxyaoai' or the scope is invalid. If access was recently granted, please refresh your credentials.
+Sharing config from Key Vault to Container App...
+(AuthorizationFailed) The client 'foo.bar@example.com' with object id '1234' does not have authorization to perform action 'Microsoft.App/containerApps/listSecrets/action' over scope '/subscriptions/1111/resourceGroups/powerproxy-aoai/providers/Microsoft.App/containerApps/powerproxyaoai' or the scope is invalid. If access was recently granted, please refresh your credentials.
+(ContainerAppSecretRefNotFound) SecretRef 'config-string' defined for container 'powerproxyaoai' not found.
+```
+
+To fix them, assign yourself a role with enough permissions to access the resources mentioned in the errors.
+You can do that with Azure CLI:
+
+```shell
+az role assignment create --assignee-object-id "1234" --role "Contributor" --scope "/subscriptions/1111/resourceGroups/powerproxy-aoai"
+```
+
+### Cleanup
+
+todo
+
 ### Log Analytics
 Log Analytics is now deployed by the contained deployment script. There is no need for taking extra
 steps any more.
+
+Example queries you can run on your logs:
+
+- List all requests to your proxy:
+
+    ```
+    AzureOpenAIUsage_PP_CL
+    | project 
+        RequestReceivedUtc,
+        Client,
+        IsStreaming,
+        PromptTokens,
+        CompletionTokens,
+        TotalTokens,
+        AoaiRoundtripTimeMS,
+        AoaiRegion,
+        AoaiEndpointName
+    ```
+
+- Visualize total tokens used per client (monthly basis) in a column chart:
+
+   ```
+   AzureOpenAIUsage_PP_CL
+   | project
+       Month=strcat(monthofyear(todatetime(RequestReceivedUtc)), "/", getyear(todatetime(RequestReceivedUtc))),
+       Client,
+       TotalTokens
+   | summarize TotalTokens = sum(TotalTokens) by Month, Client
+   | render columnchart with (kind=unstacked)
+   ```
 
 ### Configuration updates
 To update the configuration of an existing deployment, you can use the `Export-ConfigFromAzure.ps1`
