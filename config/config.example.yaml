@@ -111,6 +111,7 @@ resource_group: ___
 
 # unique prefix to prepend to certain resource names to avoid naming conflicts.
 # example: abcde
+# the ACR registry will use the prefix without its non-alphanumeric characters
 unique_prefix: ___
 
 # id of the user-assigned managed identity
