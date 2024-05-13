@@ -50,6 +50,8 @@ plugins:
 
 # Azure OpenAI
 aoai:
+  # The endpoints are prioritized from top to bottom. The first endpoint will be used until it
+  # returns a "Too Many Requests" error. After that, the 2nd endpoint is used and so on.
   endpoints:
     - name: Some Endpoint
       url: https://___.openai.azure.com/
