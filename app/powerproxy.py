@@ -164,10 +164,15 @@ async def handle_request(request: Request, path: str):
         routing_slip["incoming_request_body_dict"] = await request.json()
     except:
         pass
-    routing_slip["is_non_streaming_response_requested"] = not (
-        "stream" in routing_slip["incoming_request_body_dict"]
-        and str(routing_slip["incoming_request_body_dict"]["stream"]).lower() == "true"
-    )
+
+    if routing_slip["incoming_request_body_dict"] is None:
+        routing_slip["is_non_streaming_response_requested"] = True
+    else:
+        routing_slip["is_non_streaming_response_requested"] = not (
+                "stream" in routing_slip["incoming_request_body_dict"]
+                and str(routing_slip["incoming_request_body_dict"]["stream"]).lower() == "true"
+        )
+
     foreach_plugin(config.plugins, "on_new_request_received", routing_slip)
 
     # identify client
