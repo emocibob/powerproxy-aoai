@@ -159,6 +159,17 @@ You can do that with Azure CLI:
 az role assignment create --assignee-object-id "1234" --role "Contributor" --scope "/subscriptions/1111/resourceGroups/powerproxy-aoai"
 ```
 
+### Build the image locally
+
+Here's how you can build the container image on your machine and push it ACR:
+
+```shell
+export CONTAINER_REGISTRY_NAME="<YOUR_CONTAINER_REGISTRY_NAME>"
+docker buildx build --platform linux/amd64 -t $CONTAINER_REGISTRY_NAME.azurecr.io/powerproxyaoai:0.0.1 -f Dockerfile .
+az acr login --name $CONTAINER_REGISTRY_NAME
+docker push $CONTAINER_REGISTRY_NAME.azurecr.io/powerproxyaoai:0.0.1
+```
+
 ### Cleanup
 
 todo
