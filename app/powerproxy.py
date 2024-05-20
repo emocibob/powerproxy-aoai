@@ -7,13 +7,13 @@ PowerProxy for AOAI - reverse proxy to process requests and responses to/from Az
 
 import argparse
 import asyncio
-import datetime
 import io
 import json
 import random
+import re
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 import uvicorn
@@ -43,10 +43,7 @@ parser.add_argument(
     "--port",
     type=int,
     default=80,
-    help=(
-        "Port where the proxy runs. Ports <= 1024 may need special permissions in Linux. "
-        "Default: 80."
-    ),
+    help=("Port where the proxy runs. Ports <= 1024 may need special permissions in Linux. " "Default: 80."),
 )
 args, unknown = parser.parse_known_args()
 
@@ -65,49 +62,63 @@ async def lifespan(app: FastAPI):
     config.print()
     foreach_plugin(config.plugins, "on_print_configuration")
 
-    # collect AOAI endpoints and corresponding clients
-    app.state.aoai_endpoints = {}
+    # collect AOAI targets (endpoints or deployments) and corresponding clients
+    app.state.aoai_endpoint_clients = {}
+    app.state.aoai_targets = {}
     if config.get("aoai/mock_response"):
 
         async def get_mock_response(request):
-            ms_to_wait_before_return = config.get(
-                "aoai/mock_response/ms_to_wait_before_return"
-            )
+            ms_to_wait_before_return = config.get("aoai/mock_response/ms_to_wait_before_return")
             if ms_to_wait_before_return:
                 ms_to_wait_before_return = float(ms_to_wait_before_return)
                 await asyncio.sleep(ms_to_wait_before_return / 1_000)
             return httpx.Response(200, json=config.get("aoai/mock_response/json"))
 
-        app.state.aoai_endpoints["mock"] = {
+        app.state.aoai_endpoint_clients["mock"] = httpx.AsyncClient(
+            base_url="https://mock/",
+            transport=httpx.MockTransport(get_mock_response),
+        )
+        app.state.aoai_targets["mock"] = {
             "Mock client": {
                 "url": "",
                 "key": "",
-                "client": httpx.AsyncClient(
-                    base_url="https://mock/",
-                    transport=httpx.MockTransport(get_mock_response),
-                ),
+                "client": app.state.aoai_endpoint_clients["mock"],
                 "next_request_not_before_timestamp_ms": 0,
                 "non_streaming_fraction": 1,
             }
         }
     else:
-        app.state.aoai_endpoints = {
-            endpoint["name"]: {
-                "url": endpoint["url"],
-                "key": endpoint["key"],
-                "client": httpx.AsyncClient(base_url=endpoint["url"]),
-                "next_request_not_before_timestamp_ms": 0,
-                "non_streaming_fraction": float(endpoint["non_streaming_fraction"]),
-            }
-            for endpoint in config["aoai/endpoints"]
-        }
-    if len(app.state.aoai_endpoints) == 0:
-        raise ValueError(
-            (
-                "Missing endpoints for Azure OpenAI. Ensure that at least one endpoint for Azure "
-                "OpenAI or a mock response is configured in PowerProxy's configuration."
-            )
-        )
+        for endpoint in config["aoai/endpoints"]:
+            app.state.aoai_endpoint_clients[endpoint["name"]] = httpx.AsyncClient(base_url=endpoint["url"])
+            if "virtual_deployments" in endpoint:
+                for virtual_deployment in endpoint["virtual_deployments"]:
+                    for standin in virtual_deployment["standins"]:
+                        target_name = f"{standin['name']}@{virtual_deployment['name']}@{endpoint['name']}"
+                        app.state.aoai_targets[target_name] = {
+                            "name": target_name,
+                            "type": "virtual_deployment_standin",
+                            "endpoint": endpoint["name"],
+                            "virtual_deployment": virtual_deployment["name"],
+                            "standin": standin["name"],
+                            "url": endpoint["url"],
+                            "endpoint_client": app.state.aoai_endpoint_clients[endpoint["name"]],
+                            "next_request_not_before_timestamp_ms": 0,
+                            "non_streaming_fraction": float(
+                                standin["non_streaming_fraction"] if "non_streaming_fraction" in standin else 1
+                            ),
+                        } | ({"endpoint_key": endpoint["key"]} if "key" in endpoint else {})
+            else:
+                app.state.aoai_targets[endpoint["name"]] = {
+                    "name": endpoint["name"],
+                    "type": "endpoint",
+                    "endpoint": endpoint["name"],
+                    "url": endpoint["url"],
+                    "endpoint_client": app.state.aoai_endpoint_clients[endpoint["name"]],
+                    "next_request_not_before_timestamp_ms": 0,
+                    "non_streaming_fraction": float(
+                        endpoint["non_streaming_fraction"] if "non_streaming_fraction" in endpoint else 1
+                    ),
+                } | ({"endpoint_key": endpoint["key"]} if "key" in endpoint else {})
 
     # print serve notification
     print()
@@ -119,8 +130,8 @@ async def lifespan(app: FastAPI):
 
     # shutdown
     # close AOAI endpoint connections
-    for aoai_endpoint_name in app.state.aoai_endpoints:
-        await app.state.aoai_endpoints[aoai_endpoint_name].aclose()
+    for aoai_endpoint_client_name in app.state.aoai_endpoint_clients:
+        await app.state.aoai_endpoint_clients[aoai_endpoint_client_name].aclose()
 
 
 ## define and run proxy app
@@ -154,99 +165,115 @@ async def handle_request(request: Request, path: str):
     """Handle any incoming request."""
     # create a new routing slip, populate it with some variables and tell plugins about new request
     routing_slip = {
-        "request_received_utc": datetime.utcnow(),
+        "request_received_utc": datetime.now(timezone.utc),
         "incoming_request": request,
         "incoming_request_body": await request.body(),
         "path": path,
     }
+    routing_slip["virtual_deployment"] = None
+    deployment_match = re.search(r"(?<=deployments\/)[^\/]+", path)
+    if deployment_match:
+        routing_slip["virtual_deployment"] = deployment_match.group(0)
     routing_slip["incoming_request_body_dict"] = None
     try:
         routing_slip["incoming_request_body_dict"] = await request.json()
     except:
         pass
-
-    if routing_slip["incoming_request_body_dict"] is None:
-        routing_slip["is_non_streaming_response_requested"] = True
-    else:
-        routing_slip["is_non_streaming_response_requested"] = not (
-                "stream" in routing_slip["incoming_request_body_dict"]
-                and str(routing_slip["incoming_request_body_dict"]["stream"]).lower() == "true"
-        )
-
+    routing_slip["is_non_streaming_response_requested"] = routing_slip["incoming_request_body_dict"] and not (
+        "stream" in routing_slip["incoming_request_body_dict"]
+        and str(routing_slip["incoming_request_body_dict"]["stream"]).lower() == "true"
+    )
     foreach_plugin(config.plugins, "on_new_request_received", routing_slip)
 
     # identify client
-    # notes: - When API authentication is used, we get an API key in header 'api-key'. This
-    #          would usually be the API key for Azure Open AI, but we configure and use
-    #          client-specific keys here for the proxy to identify the client. We will replace the
-    #          API key against the real AOAI key later.
-    #        - For Azure AD authentication, we should get no API key but an Azure AD token in
-    #          header 'Authorization'. Unfortunately, we cannot interpret or modify that token,
-    #          so we need another mechanism to identify clients. In that case, we need a
-    #          separate instance of PowerProxy for each client, whereby each client uses a fixed
-    #          client.
-    #        - Some requests may neither contain an API key or an Azure AD token. In that case,
-    #          we need to make sure that the proxy continues to work.
+    # notes: - When API authentication is used, we get an API key in header 'api-key'. This would usually be the API key
+    #          for Azure Open AI, but we configure and use client-specific keys here for the proxy to identify the
+    #          client. We will replace the API key against the real AOAI key later.
+    #        - For Entra ID/Azure AD authentication, we should get no API key but a token in header 'authorization'.
+    #          Unfortunately, we cannot interpret or modify that token, so we need another mechanism to identify
+    #          clients. In that case, we need a separate instance of PowerProxy for each client, and we use the client
+    #          from the config that has 'uses_entra_id_auth: true'.
+    #        - Some requests may neither contain an API key nor an Azure AD token. In that case, we need to make sure
+    #          that the proxy continues to work.
     headers = {
         key: request.headers[key]
-        for key in set(request.headers.keys())
-        - {"Host", "host", "Content-Length", "content-length"}
+        for key in set(request.headers.keys()) - {"Host", "host", "Content-Length", "content-length"}
     }
     client = None
-    if "fixed_client" in config.values_dict and config["fixed_client"]:
-        client = config["fixed_client"]
     if "api-key" in headers:
         if headers["api-key"] not in config.key_client_map:
-            raise ValueError(
-                (
-                    "The provided API key is not a valid PowerProxy key. Ensure that the "
-                    "'api-key' header contains valid API key from the PowerProxy's "
-                    "configuration."
+            raise ImmediateResponseException(
+                Response(
+                    content=json.dumps(
+                        {
+                            "error": "The provided API key is not a valid PowerProxy key. Ensure that the 'api-key' "
+                            "header contains a valid API key from the PowerProxy's configuration."
+                        }
+                    ),
+                    media_type="application/json",
+                    status_code=status.HTTP_401_UNAUTHORIZED,
                 )
             )
         client = config.key_client_map[headers["api-key"]] if client is None else client
+    if "authorization" in headers:
+        client = config.entra_id_client["name"]
     routing_slip["client"] = client
     if client:
         foreach_plugin(config.plugins, "on_client_identified", routing_slip)
 
-    # get response from AOAI by iterating through the configured endpoints
+    # get response from AOAI by iterating through the configured targets (endpoints or deployments)
     aoai_response: httpx.Response = None
-    for aoai_endpoint_name in app.state.aoai_endpoints:
-        aoai_endpoint = app.state.aoai_endpoints[aoai_endpoint_name]
+    for aoai_target_name in app.state.aoai_targets:
+        aoai_target = app.state.aoai_targets[aoai_target_name]
 
-        # try next endpoint if this endpoint is blocked
+        # try next target if this target is blocked
+        if aoai_target["next_request_not_before_timestamp_ms"] > get_current_timestamp_in_ms():
+            continue
+
+        # try next target if target is virtual_deployment_standin and target's deployment does not match requested
+        # deployment
         if (
-            aoai_endpoint["next_request_not_before_timestamp_ms"]
-            > get_current_timestamp_in_ms()
+            aoai_target["type"] == "virtual_deployment_standin"
+            and "virtual_deployment" in routing_slip
+            and routing_slip["virtual_deployment"] != aoai_target["virtual_deployment"]
         ):
             continue
 
-        # try next endpoint if we have a non-streaming request and if we want to skip it to reserve
-        # resources for streaming requests
-        if (
-            routing_slip["is_non_streaming_response_requested"]
-            and (
-                aoai_endpoint["non_streaming_fraction"] == 0
-                or random.random() > aoai_endpoint["non_streaming_fraction"]
-            )
-            and aoai_endpoint["non_streaming_fraction"] != 1
+        # try next target if the non-streaming filter is not passed
+        if not passes_non_streaming_filter(
+            routing_slip["is_non_streaming_response_requested"], aoai_target["non_streaming_fraction"]
         ):
             continue
 
-        # replace API key against real API key from AOAI, but only if the request has an API key
-        # note: intentionally not raising an exception here to support requests using Azure AD/
-        #       Entra ID authentication.
+        # replace API key against real API key from AOAI, but only if the request has an API key and if we have an API
+        # key for the real AOAI endpoint
+        # note: intentionally not raising an exception here if an API key is missing to support requests using
+        #       Azure AD/Entra ID authentication. Entra ID requests miss an api-key header but have an Authorization
+        #       header, and we pass that as is, so AOAI will do the authentication then for us.
         if "api-key" in headers:
-            headers["api-key"] = aoai_endpoint["key"] or ""
+            if "endpoint_key" in aoai_target:
+                headers["api-key"] = aoai_target["endpoint_key"] or ""
+            else:
+                del headers["api-key"]
 
-        # remember endpoint and request start time
-        routing_slip["aoai_endpoint_name"] = aoai_endpoint_name
+        # replace deployment against standin in path if target is deployment standin
+        if aoai_target["type"] == "virtual_deployment_standin":
+            routing_slip["path"] = re.sub(
+                r"/deployments/[^/]+", f"/deployments/{aoai_target['standin']}", routing_slip["path"]
+            )
+
+        # remember target and request start time
+        routing_slip["aoai_endpoint"] = aoai_target["endpoint"]
+        routing_slip["aoai_virtual_deployment"] = (
+            aoai_target["virtual_deployment"] if "virtual_deployment" in aoai_target else None
+        )
+        routing_slip["aoai_standin_deployment"] = aoai_target["standin"] if "standin" in aoai_target else None
         routing_slip["aoai_request_start_time"] = get_current_timestamp_in_ms()
 
         # send request
         new_timeout = httpx.Timeout(timeout=5.0)
         new_timeout.read = 120.0
-        aoai_request = aoai_endpoint["client"].build_request(
+        aoai_request = aoai_target["endpoint_client"].build_request(
             request.method,
             routing_slip["path"],
             timeout=new_timeout,
@@ -254,34 +281,48 @@ async def handle_request(request: Request, path: str):
             headers=headers,
             content=routing_slip["incoming_request_body"],
         )
-        aoai_response = await aoai_endpoint["client"].send(
+        aoai_response = await aoai_target["endpoint_client"].send(
             aoai_request,
             stream=(not routing_slip["is_non_streaming_response_requested"]),
         )
+        # got http code other than 200
+        if aoai_response.status_code != 200:
+            # print infos to console
+            print(
+                (
+                    f"Unexpected HTTP Code {aoai_response.status_code} while using target '{aoai_target['name']}'. "
+                    f"Text: {aoai_response.text} "
+                    f"Path: {routing_slip['path']} "
+                    f"Url: {aoai_target['url']}"
+                )
+            )
+        # got 429 or 500
         if aoai_response.status_code in [429, 500]:
-            # got 429 or 500
             # block endpoint for some time, either according to the time given by AOAI or, if not
             # available, for 10 seconds
             waiting_time_ms_until_next_request = (
-                int(aoai_response.headers["retry-after-ms"])
-                if "retry-after-ms" in aoai_response.headers
-                else 10_000
+                int(aoai_response.headers["retry-after-ms"]) if "retry-after-ms" in aoai_response.headers else 10_000
             )
-            aoai_endpoint["next_request_not_before_timestamp_ms"] = (
+            aoai_target["next_request_not_before_timestamp_ms"] = (
                 get_current_timestamp_in_ms() + waiting_time_ms_until_next_request
             )
-            # try next endpoint
+
+            # try next target
             continue
 
-        # if we reached here, we found an endpoint which is able to serve our request
+        # if we reached here, we found a target which is able to serve our request
         # -> go ahead
         break
 
-    # raise 429 if we could not find any suitable endpoint
+    # raise 429 if we could not find any suitable target
     if aoai_response is None:
         raise ImmediateResponseException(
             Response(
-                content="Could not find any endpoint with remaining capacity. Try again later.",
+                content=json.dumps(
+                    {"message": "Could not find any endpoint or deployment with remaining capacity. Try again later."}
+                ),
+                headers={"retry-after-ms", 10_000},
+                media_type="application/json",
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             )
         )
@@ -292,14 +333,12 @@ async def handle_request(request: Request, path: str):
 
     # determine if it's actually an event stream or not
     routing_slip["is_event_stream"] = (
-        "content-type" in aoai_response.headers
-        and aoai_response.headers["content-type"] == "text/event-stream"
+        "content-type" in aoai_response.headers and aoai_response.headers["content-type"] == "text/event-stream"
     )
 
     # return different response types depending if it's an event stream or not
     routing_slip["response_headers_from_target"] = {
-        header_item[0].decode(): header_item[1].decode()
-        for header_item in aoai_response.headers.raw
+        header_item[0].decode(): header_item[1].decode() for header_item in aoai_response.headers.raw
     }
     match routing_slip["is_event_stream"]:
         case False:
@@ -308,9 +347,7 @@ async def handle_request(request: Request, path: str):
             measure_aoai_roundtrip_time_ms(routing_slip)
             try:
                 routing_slip["body_dict_from_target"] = json.load(io.BytesIO(body))
-                foreach_plugin(
-                    config.plugins, "on_body_dict_from_target_available", routing_slip
-                )
+                foreach_plugin(config.plugins, "on_body_dict_from_target_available", routing_slip)
             except:
                 # eat any exception in case the response cannot be parsed
                 pass
@@ -319,10 +356,7 @@ async def handle_request(request: Request, path: str):
                 status_code=aoai_response.status_code,
                 headers=routing_slip["response_headers_from_target"],
             )
-            if (
-                "Transfer-Encoding" in response.headers
-                and "Content-Length" in response.headers
-            ):
+            if "Transfer-Encoding" in response.headers and "Content-Length" in response.headers:
                 del response.headers["Content-Length"]
             return response
         case True:
@@ -370,10 +404,20 @@ def measure_aoai_roundtrip_time_ms(routing_slip):
     )
 
 
+def passes_non_streaming_filter(is_non_streaming_response_requested, non_streaming_fraction):
+    """Determines by chance if a request should be processed or not."""
+    return (
+        True
+        if not is_non_streaming_response_requested
+        else not (
+            non_streaming_fraction != 1 and (non_streaming_fraction == 0 or random.random() > non_streaming_fraction)
+        )
+    )
+
+
 if __name__ == "__main__":
-    # note: this applies only when the powerproxy.py script is executed directly. In the Dockerfile
-    #       provided, we use a uvicorn command to run the app, so parameters might need to be
-    #       modified there AS WELL.
+    # note: this applies only when the powerproxy.py script is executed directly. In the Dockerfile provided, we use a
+    #       uvicorn command to run the app, so parameters might need to be modified there AS WELL.
     uvicorn.run(
         app,
         host="0.0.0.0",

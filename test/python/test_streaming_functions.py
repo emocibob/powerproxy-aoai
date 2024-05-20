@@ -4,23 +4,36 @@ Script to test the proxy's ability to support response streaming when functions 
 Tested with openai package version 1.12.0.
 """
 
-# pylint: disable=not-an-iterable, duplicate-key
-
+import argparse
 import json
+
 from openai import AzureOpenAI
 
-client = AzureOpenAI(
-    azure_endpoint="http://localhost",
-    api_version="2024-02-01",
-    api_key="72bd81ef32763530b29e3da63d46ad6",
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--powerproxy-endpoint", type=str, default="http://localhost", help="Path to PowerProxy/Azure OpenAI endpoint"
 )
+parser.add_argument(
+    "--api-key", type=str, default="04ae14bc78184621d37f1ce57a52eb7", help="API key to access PowerProxy"
+)
+parser.add_argument(
+    "--deployment-name", type=str, default="gpt-4-turbo", help="Name of Azure OpenAI deployment to test"
+)
+parser.add_argument(
+    "--api-version", type=str, default="2024-02-01", help="API version to use when accessing Azure OpenAI"
+)
+args, unknown = parser.parse_known_args()
 
-deployment_name = "gpt-4-turbo"
+client = AzureOpenAI(
+    azure_endpoint=args.powerproxy_endpoint,
+    api_version=args.api_version,
+    api_key=args.api_key,
+)
 
 function_name = ""
 arguments = ""
 for chunk in client.chat.completions.create(
-    model=deployment_name,
+    model=args.deployment_name,
     messages=[
         {
             "role": "user",
@@ -91,16 +104,14 @@ for chunk in client.chat.completions.create(
 
 def search_hotels(location, max_price, features):
     """Searches for hotels."""
-    print(
-        f"Searching hotels in {location} with max price {max_price} and {features}..."
-    )
-    print("TODO: Complete -- this function is only for demo purposes.")
+    print("Hi there -- this is function search_hotels(). I was invoked with the following commands:")
+    print(f"Location: {location}, max price {max_price}, features: {features}")
 
 
 def book_hotel(name, start_date, end_date):
     """Books a hotel."""
-    print(f"Booking hotel '{name}'. Start date: {start_date}, End date: {end_date}...")
-    print("TODO: Complete -- this function is only for demo purposes.")
+    print("Hi there -- this is function book_hotel(). I was invoked with the following commands:")
+    print(f"Booking hotel '{name}'. Start date: {start_date}, End date: {end_date}")
 
 
 print(f"Function Name: {function_name}")

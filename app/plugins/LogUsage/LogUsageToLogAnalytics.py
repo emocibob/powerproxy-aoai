@@ -20,6 +20,24 @@ class LogUsageToLogAnalytics(LogUsageBase):
 
     log_analytics_client = None
 
+    plugin_config_jsonschema = {
+        "$schema": "http://json-schema.org/draft/2019-09/schema#",
+        "$ref": "#/definitions/PluginConfiguration",
+        "definitions": {
+            "PluginConfiguration": {
+                "type": "object",
+                "properties": {
+                    "log_ingestion_endpoint": {"type": "string"},
+                    "data_collection_rule_id": {"type": "string"},
+                    "credential_tenant_id": {"type": "string"},
+                    "credential_client_id": {"type": "string"},
+                    "credential_client_secret": {"type": "string"},
+                },
+                "required": ["log_ingestion_endpoint", "data_collection_rule_id"],
+            },
+        },
+    }
+
     def __init__(self, app_configuration: QueryDict, plugin_configuration: QueryDict):
         """Constructor."""
         super().__init__(app_configuration, plugin_configuration)
@@ -33,11 +51,7 @@ class LogUsageToLogAnalytics(LogUsageBase):
         self.credential_client_secret = plugin_configuration.get("credential_client_secret")
         self.auth_mechanism = (
             "ClientSecretCredential"
-            if (
-                self.credential_tenant_id
-                and self.credential_client_id
-                and self.credential_client_secret
-            )
+            if (self.credential_tenant_id and self.credential_client_id and self.credential_client_secret)
             else "ManagedIdentityCredential"
         )
         self.data_collection_rule_id = plugin_configuration.get("data_collection_rule_id")
@@ -55,13 +69,8 @@ class LogUsageToLogAnalytics(LogUsageBase):
                 client_id=self.credential_client_id,
                 client_secret=self.credential_client_secret,
             )
-        elif (
-            self.auth_mechanism == "ManagedIdentityCredential"
-            and self.user_assigned_managed_identity_client_id
-        ):
-            credential = ManagedIdentityCredential(
-                client_id=self.user_assigned_managed_identity_client_id
-            )
+        elif self.auth_mechanism == "ManagedIdentityCredential" and self.user_assigned_managed_identity_client_id:
+            credential = ManagedIdentityCredential(client_id=self.user_assigned_managed_identity_client_id)
 
         else:
             credential = ManagedIdentityCredential()
@@ -83,13 +92,9 @@ class LogUsageToLogAnalytics(LogUsageBase):
         if self.auth_mechanism == "ClientSecretCredential":
             Configuration.print_setting("Credential Tenant ID", self.credential_tenant_id, 1)
             Configuration.print_setting("Credential Client ID", self.credential_client_id, 1)
-        if (
-            self.auth_mechanism == "ManagedIdentityCredential"
-            and self.user_assigned_managed_identity_client_id
-        ):
+        if self.auth_mechanism == "ManagedIdentityCredential" and self.user_assigned_managed_identity_client_id:
             Configuration.print_setting(
-                "User-Assigned Managed Credential ID",
-                self.user_assigned_managed_identity_client_id,
+                "User-Assigned Managed Credential ID", self.user_assigned_managed_identity_client_id, 1
             )
 
     def _append_line(
@@ -102,7 +107,9 @@ class LogUsageToLogAnalytics(LogUsageBase):
         total_tokens,
         aoai_roundtrip_time_ms,
         aoai_region,
-        aoai_endpoint_name,
+        aoai_endpoint,
+        aoai_virtual_deployment,
+        aoai_standin_deployment,
     ):
         """Append a new line with the given infos."""
         # pylint: disable=no-value-for-parameter
@@ -119,7 +126,9 @@ class LogUsageToLogAnalytics(LogUsageBase):
                     "TotalTokens": total_tokens,
                     "AoaiRoundtripTimeMS": aoai_roundtrip_time_ms,
                     "AoaiRegion": aoai_region,
-                    "AoaiEndpointName": aoai_endpoint_name,
+                    "AoaiEndpoint": aoai_endpoint,
+                    "AoaiVirtualDeployment": aoai_virtual_deployment,
+                    "AoaiStandinDeployment": aoai_standin_deployment,
                 }
             ],
         )

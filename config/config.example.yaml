@@ -1,33 +1,41 @@
-# the teams or use cases accessing Azure OpenAI (aka. "clients") and their keys
+# the teams or use cases accessing Azure OpenAI (aka. "clients")
 # notes: - each client must have a unique key. PowerProxy identifies clients by the given key.
-#        - leave empty if Azure AD auth against Azure OpenAI is used.
+#        - one and only one client can use "uses_entra_id_auth: true" instead of a key. this client is used for all
+#          requests where an Entra ID/Azure AD authentication shall be used instead of an API key authentication.
 clients:
   - name: Team 1
     description: An example team named 'Team 1'.
     key: 28ef59ae30342978f81c4ad96ce47ab
-    max_tokens_per_minute_in_k: 10
+    deployments_allowed: gpt-35-turbo, gpt-4-turbo
+    max_tokens_per_minute_in_k:
+      gpt-35-turbo: 20
+      gpt-4-turbo: 5
   - name: Team 2
     description: An example team named 'Team 2'.
     key: 1113456789abcdef0123456789abcde
-    max_tokens_per_minute_in_k: 10
+    deployments_allowed:
+      - gpt-35-turbo
+      - gpt-4-turbo
+    max_tokens_per_minute_in_k: 30
   - name: Test Script Client 1
-    description: Used by the included test scripts. Remove this client in production scenarios.
+    description: Used by the included test scripts.
     key: 04ae14bc78184621d37f1ce57a52eb7
-    max_tokens_per_minute_in_k: 10
+    deployments_allowed: [gpt-35-turbo, gpt-4-turbo]
+    max_tokens_per_minute_in_k: 5
   - name: Test Script Client 2
-    description: Used by the included test scripts. Remove this client in production scenarios.
+    description: Used by the included test scripts.
     key: 72bd81ef32763530b29e3da63d46ad6
+    deployments_allowed: gpt-35-turbo, gpt-4-turbo
+    max_tokens_per_minute_in_k: 5
+  - name: Entra ID Auth Client
+    description: Client used whenever a client authenticates via Entra ID / Azure AD.
+    uses_entra_id_auth: true
+    deployments_allowed: gpt-35-turbo, gpt-4-turbo
     max_tokens_per_minute_in_k: 10
-
-# if set, the proxy will always use the specified client for all requests
-# notes: - this is required when Azure AD auth against Azure OpenAI is used because there is no
-#          other way to identify the client then.
-#        - omit or leave empty ("") when API key authentication is used.
-# example: Some Team
-#fixed_client:
 
 # defines the plugins enabled for the proxy
 plugins:
+  - name: AllowDeployments
   - name: LimitUsage
     # remove the redis field if no redis synchronization is desired
     # note: do that only in case of a single PowerProxy worker where no synchronization is needed
@@ -73,6 +81,21 @@ aoai:
       # 1   = endpoint will handle all non-streaming request it gets
       non_streaming_fraction: 1
 
+      # endpoints can also have "virtual deployments" (optional). when a virtual deployment is defined, requests
+      # requesting specific deployments are rewritten such that a smart load balancing across the listed "stand-ins"
+      # = real deployments at the endpoint happens. similar to the non_streaming_fraction at the endpoint level, we
+      # can also set non_streaming_fractions for stand-ins.
+      virtual_deployments:
+        - name: gpt-35-turbo
+          standins:
+            - name: gpt-35-turbo-ptu
+              non_streaming_fraction: 0.2
+            - name: gpt-35-turbo-paygo
+        - name: gpt-4-turbo
+          standins:
+            - name: gpt-4-turbo-ptu
+              non_streaming_fraction: 0.2
+            - name: gpt-4-turbo-paygo
   # # alternatively, specify a mock response to be used instead of the real response from
   # # Azure OpenAI
   # # note: use this for testing PowerProxy's scalability
