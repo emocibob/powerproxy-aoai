@@ -25,9 +25,7 @@ parser.add_argument(
 parser.add_argument(
     "--api-key", type=str, default="04ae14bc78184621d37f1ce57a52eb7", help="API key to access PowerProxy"
 )
-parser.add_argument(
-    "--deployment-name", type=str, default="gpt-4-turbo", help="Name of Azure OpenAI deployment to test"
-)
+parser.add_argument("--deployment-name", type=str, default="gpt-4o", help="Name of Azure OpenAI deployment to test")
 parser.add_argument(
     "--api-version", type=str, default="2024-02-01", help="API version to use when accessing Azure OpenAI"
 )
@@ -75,19 +73,6 @@ def send_post_request(api_key=None, authorization_token=None):
     )
 
 
-# do a liveness check to ensure that PowerProxy is running
-print("Checking if PowerProxy is up and running...")
-try:
-    response = requests.get(f"{args.powerproxy_endpoint}/powerproxy/health/liveness", timeout=None)
-    assert response.status_code == 204
-except Exception as exception:
-    raise Exception(  # pylint: disable=broad-exception-raised
-        (
-            "Could not connect to PowerProxy. Is it up and running? PowerProxy needs to be started before running the"
-            "tests."
-        )
-    ) from exception
-
 # regular API key authentication
 print("Testing regular API key authentication...")
 response = send_post_request(api_key=args.api_key)
@@ -107,11 +92,21 @@ assert response.status_code == 401
 
 # regular Entra ID/Azure AD authentication
 # note: this needs a proper setup of permissions, see above for details
-print("Testing regular Entra ID/Azure AD authentication...")
-print("Note: This requires sufficient permissions on the Azure OpenAI side for the user running this script.")
+print(
+    (
+        "Testing regular Entra ID/Azure AD authentication (ensure you have correct permissions before running this test"
+        ")..."
+    )
+)
 response = send_post_request(
     authorization_token=DefaultAzureCredential().get_token("https://cognitiveservices.azure.com/.default").token
 )
+assert response.status_code == 200
+
+# same API key and Bearer token
+# note: some openai package versions use this
+print("Testing regular API key and same API key in Authorization: Bearer...")
+response = send_post_request(api_key=args.api_key, authorization_token=args.api_key)
 assert response.status_code == 200
 
 # wrong authentication token

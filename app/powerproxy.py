@@ -17,9 +17,11 @@ from datetime import datetime, timezone
 
 import httpx
 import uvicorn
+from azure.identity import DefaultAzureCredential
 from fastapi import FastAPI, Request, status
 from fastapi.responses import Response, StreamingResponse
 from helpers.config import Configuration
+from helpers.dicts import QueryDict
 from helpers.header import print_header
 from plugins.base import ImmediateResponseException, foreach_plugin
 from version import VERSION
@@ -65,6 +67,7 @@ async def lifespan(app: FastAPI):
     # collect AOAI targets (endpoints or deployments) and corresponding clients
     app.state.aoai_endpoint_clients = {}
     app.state.aoai_targets = {}
+    app.state.virtual_deployment_names = []
     if config.get("aoai/mock_response"):
 
         async def get_mock_response(request):
@@ -89,9 +92,38 @@ async def lifespan(app: FastAPI):
         }
     else:
         for endpoint in config["aoai/endpoints"]:
-            app.state.aoai_endpoint_clients[endpoint["name"]] = httpx.AsyncClient(base_url=endpoint["url"])
+            endpoint_qd = QueryDict(endpoint)
+            limits = httpx.Limits(
+                max_keepalive_connections=int(endpoint_qd["connections/limits/max_keepalive_connections"])
+                if endpoint_qd["connections/limits/max_keepalive_connections"]
+                else 20,
+                max_connections=int(endpoint_qd["connections/limits/max_connections"])
+                if endpoint_qd["connections/limits/max_connections"]
+                else 100,
+                keepalive_expiry=float(endpoint_qd["connections/limits/keepalive_expiry"])
+                if endpoint_qd["connections/limits/keepalive_expiry"]
+                else 5.0,
+            )
+            timeout = httpx.Timeout(
+                connect=float(endpoint_qd["connections/timeouts/connect"])
+                if endpoint_qd["connections/timeouts/connect"]
+                else 15.0,
+                read=float(endpoint_qd["connections/timeouts/read"])
+                if endpoint_qd["connections/timeouts/read"]
+                else 120.0,
+                write=float(endpoint_qd["connections/timeouts/write"])
+                if endpoint_qd["connections/timeouts/write"]
+                else 120.0,
+                pool=float(endpoint_qd["connections/timeouts/pool"])
+                if endpoint_qd["connections/timeouts/pool"]
+                else 120.0,
+            )
+            app.state.aoai_endpoint_clients[endpoint["name"]] = httpx.AsyncClient(
+                base_url=endpoint["url"], timeout=timeout, limits=limits
+            )
             if "virtual_deployments" in endpoint:
                 for virtual_deployment in endpoint["virtual_deployments"]:
+                    app.state.virtual_deployment_names.append(virtual_deployment["name"])
                     for standin in virtual_deployment["standins"]:
                         target_name = f"{standin['name']}@{virtual_deployment['name']}@{endpoint['name']}"
                         app.state.aoai_targets[target_name] = {
@@ -119,6 +151,9 @@ async def lifespan(app: FastAPI):
                         endpoint["non_streaming_fraction"] if "non_streaming_fraction" in endpoint else 1
                     ),
                 } | ({"endpoint_key": endpoint["key"]} if "key" in endpoint else {})
+
+    # get DefaultAzureCredential
+    app.state.default_azure_credential = DefaultAzureCredential()
 
     # print serve notification
     print()
@@ -183,6 +218,7 @@ async def handle_request(request: Request, path: str):
         "stream" in routing_slip["incoming_request_body_dict"]
         and str(routing_slip["incoming_request_body_dict"]["stream"]).lower() == "true"
     )
+    routing_slip["api_version"] = request.query_params["api-version"] if "api-version" in request.query_params else ""
     foreach_plugin(config.plugins, "on_new_request_received", routing_slip)
 
     # identify client
@@ -215,11 +251,44 @@ async def handle_request(request: Request, path: str):
                 )
             )
         client = config.key_client_map[headers["api-key"]] if client is None else client
-    if "authorization" in headers:
-        client = config.entra_id_client["name"]
+    elif "authorization" in headers:
+        if config.entra_id_client:
+            client = config.entra_id_client["name"]
+        else:
+            raise ImmediateResponseException(
+                Response(
+                    content=json.dumps(
+                        {
+                            "error": "When Entra ID/Azure AD is used to authenticate, PowerProxy needs a client in its "
+                            "configuration configured with 'uses_entra_id_auth: true', so PowerProxy can map the "
+                            "request to a client."
+                        }
+                    ),
+                    media_type="application/json",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                )
+            )
     routing_slip["client"] = client
     if client:
         foreach_plugin(config.plugins, "on_client_identified", routing_slip)
+
+    # if virtual deployments are used, make sure the requested deployment is configured
+    if (
+        app.state.virtual_deployment_names
+        and routing_slip["virtual_deployment"] not in app.state.virtual_deployment_names
+    ):
+        raise ImmediateResponseException(
+            Response(
+                content=json.dumps(
+                    {
+                        "error": f"The specified deployment '{routing_slip['virtual_deployment']}' is not available. "
+                        "Ensure that you send the request to an existing virtual deployment configured in PowerProxy."
+                    }
+                ),
+                media_type="application/json",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        )
 
     # get response from AOAI by iterating through the configured targets (endpoints or deployments)
     aoai_response: httpx.Response = None
@@ -245,8 +314,8 @@ async def handle_request(request: Request, path: str):
         ):
             continue
 
-        # replace API key against real API key from AOAI, but only if the request has an API key and if we have an API
-        # key for the real AOAI endpoint
+        # update auth headers against real API key from AOAI/Entra ID bearer token for AOAI, but only if the request has
+        # a (previously successfully verified) API key
         # note: intentionally not raising an exception here if an API key is missing to support requests using
         #       Azure AD/Entra ID authentication. Entra ID requests miss an api-key header but have an Authorization
         #       header, and we pass that as is, so AOAI will do the authentication then for us.
@@ -255,6 +324,14 @@ async def handle_request(request: Request, path: str):
                 headers["api-key"] = aoai_target["endpoint_key"] or ""
             else:
                 del headers["api-key"]
+                if "authorization" in headers:
+                    del headers["authorization"]
+                if "Authorization" in headers:
+                    del headers["Authorization"]
+                token = app.state.default_azure_credential.get_token(
+                    "https://cognitiveservices.azure.com/.default"
+                ).token
+                headers["Authorization"] = f"Bearer {token}"
 
         # replace deployment against standin in path if target is deployment standin
         if aoai_target["type"] == "virtual_deployment_standin":
@@ -271,12 +348,9 @@ async def handle_request(request: Request, path: str):
         routing_slip["aoai_request_start_time"] = get_current_timestamp_in_ms()
 
         # send request
-        new_timeout = httpx.Timeout(timeout=5.0)
-        new_timeout.read = 120.0
         aoai_request = aoai_target["endpoint_client"].build_request(
             request.method,
             routing_slip["path"],
-            timeout=new_timeout,
             params=request.query_params,
             headers=headers,
             content=routing_slip["incoming_request_body"],
@@ -285,19 +359,21 @@ async def handle_request(request: Request, path: str):
             aoai_request,
             stream=(not routing_slip["is_non_streaming_response_requested"]),
         )
-        # got http code other than 200
-        if aoai_response.status_code != 200:
+        # got http code other than 200 or 401
+        if aoai_response.status_code not in [200, 401]:
             # print infos to console
+            if not routing_slip["is_non_streaming_response_requested"]:
+                await aoai_response.aread()
             print(
                 (
                     f"Unexpected HTTP Code {aoai_response.status_code} while using target '{aoai_target['name']}'. "
-                    f"Text: {aoai_response.text} "
                     f"Path: {routing_slip['path']} "
-                    f"Url: {aoai_target['url']}"
+                    f"Target Url: {aoai_target['url']}"
+                    f"Response: {aoai_response.text}"
                 )
             )
-        # got 429 or 500
-        if aoai_response.status_code in [429, 500]:
+        # got 408/Request Timeout, 429/Too Many Requests, or 500/Internal Server Error
+        if aoai_response.status_code in [408, 429, 500]:
             # block endpoint for some time, either according to the time given by AOAI or, if not
             # available, for 10 seconds
             waiting_time_ms_until_next_request = (
@@ -321,7 +397,7 @@ async def handle_request(request: Request, path: str):
                 content=json.dumps(
                     {"message": "Could not find any endpoint or deployment with remaining capacity. Try again later."}
                 ),
-                headers={"retry-after-ms", 10_000},
+                headers={"retry-after-ms": f"{10_000}"},
                 media_type="application/json",
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             )
@@ -333,7 +409,7 @@ async def handle_request(request: Request, path: str):
 
     # determine if it's actually an event stream or not
     routing_slip["is_event_stream"] = (
-        "content-type" in aoai_response.headers and aoai_response.headers["content-type"] == "text/event-stream"
+        "content-type" in aoai_response.headers and "text/event-stream" in aoai_response.headers["content-type"]
     )
 
     # return different response types depending if it's an event stream or not
